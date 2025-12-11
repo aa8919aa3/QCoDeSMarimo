@@ -1,0 +1,129 @@
+name: Run mypy and pytest
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+on:
+  push:
+    branches:
+      - 'main'
+      - 'release/*'
+    tags:
+      - 'v*'
+  pull_request:
+  merge_group:
+    branches: ['main']
+
+permissions:
+  contents: read
+
+jobs:
+  pytestmypy:
+
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # don't stop other jobs if one fails
+      # this is often due to network issues
+      # and or flaky tests
+      # and the time lost in such cases
+      # is bigger than the gain from canceling the job
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        min-version: [false]
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+            min-version: true
+        exclude:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.14"
+    env:
+      OS: ${{ matrix.os }}
+      PYTHON: ${{ matrix.python-version }}
+
+    steps:
+
+    - name: Harden Runner
+      uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+      with:
+        egress-policy: audit
+
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      with:
+        submodules: true
+        # we need full history with tags for the version number
+        fetch-depth: '0'
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: 'pip'
+        cache-dependency-path: |
+          pyproject.toml
+          requirements.txt
+    - name: upgrade pip setuptools wheel
+      run: python -m pip install --upgrade pip setuptools wheel
+      shell: bash
+    - name: install qcodes with minimum requirements
+      run: |
+        pip install uv
+        uv pip compile pyproject.toml --extra test --resolution=lowest-direct --output-file min-requirements.txt
+        pip install -r min-requirements.txt
+        pip install .[test]
+        echo "PYTEST_OPT=-Wignore" >> $GITHUB_ENV
+      if: ${{ matrix.min-version }}
+    - name: install qcodes
+      run: |
+        pip install .[test] -c requirements.txt
+        echo "PYTEST_OPT=" >> $GITHUB_ENV
+      if: ${{ !matrix.min-version }}
+    - name: Get Pyright Version
+      id: pyright-version
+      run: |
+        PYRIGHT_VERSION=$(jq -r '.devDependencies.pyright' < package.json)
+        echo $PYRIGHT_VERSION
+        echo "version=$PYRIGHT_VERSION" >> $GITHUB_OUTPUT
+      working-directory: .github
+      shell: bash
+
+    # below we use always to ensure that the steps are run
+    # even if the previous steps fail. This allows users to get feedback
+    # from both typechecking and tests even if one of them fails.
+    - name: Run Pyright
+      uses: jakebailey/pyright-action@6cabc0f01c4994be48fd45cd9dbacdd6e1ee6e5e # v2.3.3
+      with:
+        version: ${{ steps.pyright-version.outputs.version }}
+      if: ${{ !matrix.min-version && always() }}
+      id: pyright
+    - name: Run Mypy
+      run: mypy -p qcodes
+      if: ${{ !matrix.min-version && always() }}
+      id: mypy
+    - name: Run parallel tests
+      if: ${{ always() }}
+      run: |
+        pytest -m "not serial" --cov --cov-report xml --hypothesis-profile ci  --durations=20 $PYTEST_OPT tests
+      id: parallel_tests
+# a subset of the tests fails when run in parallel on Windows so run those in serial here
+    - name: Run serial tests
+      if: ${{ always() }}
+      run: |
+        pytest -m "serial" -n 0 --dist no --cov --cov-report xml --cov-append --hypothesis-profile ci $PYTEST_OPT tests
+      id: serial_tests
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@671740ac38dd9b0130fbe1cec585b89eea48d3de # v5.5.2
+      with:
+        files: ./coverage.xml
+        env_vars: OS,PYTHON
+        token: ${{ secrets.CODECOV_TOKEN }}
+      if: ${{ github.event_name != 'merge_group' }}
+      # we don't trigger coverage from merge groups since that would
+      # make twice the number of coverage reports be uploded from a given commit
